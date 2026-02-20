@@ -15,15 +15,11 @@ const CONFIG = {
   SPREAD_EXIT_THRESHOLD:  parseFloat(process.env.SPREAD_EXIT_THRESHOLD  || '0.2'),
   SIGNAL_COOLDOWN_MS:     parseInt(process.env.SIGNAL_COOLDOWN_MS       || '60000'),
 
-  KC_FUTURES_REST:  'https://api-futures.kucoin.com',
-  SYMBOLS_PER_SUB:  parseInt(process.env.SYMBOLS_PER_SUB || '50'),
+  KC_FUTURES_REST:   'https://api-futures.kucoin.com',
+  SYMBOLS_PER_SUB:   parseInt(process.env.SYMBOLS_PER_SUB || '50'),
   RECONNECT_DELAY_MS: 5_000,
 
-  // ── DEBUG ──────────────────────────────────────────────────────────────────
-  // true = виводить перші N сирих повідомлень у консоль, щоб побачити реальну
-  // структуру даних KuCoin (topic, subject, data fields)
-  DEBUG_RAW_MESSAGES: process.env.DEBUG_RAW_MESSAGES === 'true',
-  DEBUG_LIMIT:        parseInt(process.env.DEBUG_LIMIT || '5'),
+  DEBUG_RAW: process.env.DEBUG_RAW === 'true',
 };
 
 if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
@@ -35,14 +31,12 @@ if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
 const tg = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN);
 
 const state = {
-  symbols:          [],
-  activeSignals:    new Map(),
-  lastSignalTime:   new Map(),
-  lastIndexPrice:   new Map(),
-  connections:      [],
-  debugMsgCount:    0,      // лічильник для debug-режиму
-  totalMsgCount:    0,      // загальна кількість отриманих data-повідомлень
-  lastStatsLog:     Date.now(),
+  symbols:         [],
+  activeSignals:   new Map(),  // symbol → { direction, entryTime, entrySpread }
+  lastSignalTime:  new Map(),  // symbol → timestamp
+  lastIndexPrice:  new Map(),  // symbol → indexPrice (кеш)
+  connections:     [],
+  stats: { msgs: 0, lastLog: Date.now() },
 };
 
 // ─── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -53,14 +47,14 @@ function sendTelegram(text) {
 
 // ─── ФОРМАТУВАННЯ ──────────────────────────────────────────────────────────────
 function formatEntry(symbol, spread, markPrice, indexPrice) {
-  const direction = markPrice < indexPrice ? '🟢' : '🔴';
-  const millisStr = new Date().toISOString().slice(11, 23) + ' UTC';
+  const icon = markPrice < indexPrice ? '🟢' : '🔴';
+  const time = new Date().toISOString().slice(11, 23) + ' UTC';
   return (
     `🚨 <b>KuCoin - ${Math.abs(spread).toFixed(2)}%</b>\n\n` +
     `👉<b>${symbol}</b>👈\n\n` +
-    `${direction} Остання ціна: ${markPrice}\n` +
+    `${icon} Остання ціна: ${markPrice}\n` +
     `⚖️ Справедлива: ${indexPrice}\n` +
-    `⏰ Виявлено: ${millisStr}`
+    `⏰ Виявлено: ${time}`
   );
 }
 
@@ -80,6 +74,7 @@ function formatExit(symbol, markPrice, indexPrice, spread, sig) {
 
 // ─── ЛОГІКА СПРЕДУ ─────────────────────────────────────────────────────────────
 function processInstrument(symbol, markPrice, indexPrice) {
+  // Кеш indexPrice — якщо відсутній у пакеті беремо останнє відоме
   if (!isNaN(indexPrice) && indexPrice > 0) {
     state.lastIndexPrice.set(symbol, indexPrice);
   } else {
@@ -88,28 +83,27 @@ function processInstrument(symbol, markPrice, indexPrice) {
 
   if (isNaN(markPrice) || isNaN(indexPrice) || indexPrice === 0) return;
 
-  state.totalMsgCount++;
+  state.stats.msgs++;
+
+  // Лог кожні 2 хвилини: скільки повідомлень обробили
+  if (Date.now() - state.stats.lastLog > 2 * 60 * 1000) {
+    console.log(`[STATS] Processed: ${state.stats.msgs} msgs | Active signals: ${state.activeSignals.size}`);
+    for (const [sym, sig] of state.activeSignals) {
+      const age = Math.round((Date.now() - sig.entryTime) / 1000);
+      console.log(`  → ${sym} ${sig.direction} | entry spread=${sig.entrySpread.toFixed(3)}% | ${age}s ago`);
+    }
+    state.stats.msgs   = 0;
+    state.stats.lastLog = Date.now();
+  }
 
   const spread    = ((markPrice - indexPrice) / indexPrice) * 100;
   const absSpread = Math.abs(spread);
-
-  const hasSignal  = state.activeSignals.has(symbol);
-  const lastSent   = state.lastSignalTime.get(symbol) || 0;
-  const cooldownOk = (Date.now() - lastSent) >= CONFIG.SIGNAL_COOLDOWN_MS;
-
-  // Лог активних сигналів кожні 5 хвилин
-  if (Date.now() - state.lastStatsLog > 5 * 60 * 1000) {
-    console.log(`[STATS] Messages processed: ${state.totalMsgCount} | Active signals: ${state.activeSignals.size}`);
-    if (state.activeSignals.size > 0) {
-      for (const [sym, sig] of state.activeSignals) {
-        console.log(`  → ${sym} ${sig.direction} entry=${sig.entrySpread.toFixed(3)}% since ${new Date(sig.entryTime).toISOString()}`);
-      }
-    }
-    state.lastStatsLog = Date.now();
-  }
+  const hasSignal = state.activeSignals.has(symbol);
+  const lastSent  = state.lastSignalTime.get(symbol) || 0;
+  const cooldown  = (Date.now() - lastSent) >= CONFIG.SIGNAL_COOLDOWN_MS;
 
   // ── ENTRY ──────────────────────────────────────────────────────────────────
-  if (!hasSignal && absSpread >= CONFIG.SPREAD_ENTRY_THRESHOLD && cooldownOk) {
+  if (!hasSignal && absSpread >= CONFIG.SPREAD_ENTRY_THRESHOLD && cooldown) {
     console.log(`[ENTRY] ${symbol} spread=${spread.toFixed(3)}% mark=${markPrice} idx=${indexPrice}`);
     state.activeSignals.set(symbol, {
       direction:   spread > 0 ? 'SHORT' : 'LONG',
@@ -130,62 +124,42 @@ function processInstrument(symbol, markPrice, indexPrice) {
   }
 }
 
-// ─── ПАРСИНГ ПОВІДОМЛЕННЯ ──────────────────────────────────────────────────────
-// KuCoin може надсилати дані у різних форматах залежно від версії API.
-// Ця функція пробує всі відомі варіанти.
-function handleDataMessage(msg) {
-  const topic   = msg.topic ?? '';
+// ─── ПАРСИНГ ПОВІДОМЛЕНЬ ───────────────────────────────────────────────────────
+function handleMessage(msg) {
+  if (msg.type !== 'message') return;
+
+  const topic   = msg.topic   ?? '';
   const subject = msg.subject ?? '';
-  const data    = msg.data ?? {};
+  const data    = msg.data    ?? {};
 
-  // DEBUG: показуємо перші N повідомлень як є
-  if (CONFIG.DEBUG_RAW_MESSAGES && state.debugMsgCount < CONFIG.DEBUG_LIMIT) {
-    state.debugMsgCount++;
-    console.log(`\n[DEBUG MSG #${state.debugMsgCount}]`);
-    console.log('  topic:  ', topic);
-    console.log('  subject:', subject);
-    console.log('  data:   ', JSON.stringify(data));
+  if (CONFIG.DEBUG_RAW) {
+    console.log('[RAW]', JSON.stringify({ topic, subject, dataKeys: Object.keys(data) }));
   }
 
-  // Варіант 1: subject === 'mark.index.price'  (стандарт /contract/instrument)
-  // Варіант 2: subject === 'mark.index.price.v2' (деякі версії)
-  // Варіант 3: окремий топік /contract/markPrice:{symbol}
-  const isMarkIndex = (
-    subject === 'mark.index.price' ||
-    subject === 'mark.index.price.v2' ||
-    subject === 'markIndexPrice' ||
-    topic.includes('/contract/markPrice') ||
-    topic.includes('/contract/instrument')
-  );
-
-  if (!isMarkIndex) return;
-
-  // Витягуємо символ — KuCoin повертає topic вигляду:
-  // '/contract/instrument:BTCUSDTM' (якщо одиночна підписка)
-  // '/contract/instrument:BTCUSDTM' (навіть при груповій — кожне повідомлення окремо)
-  let symbol = '';
-  const topicParts = topic.split(':');
-  if (topicParts.length >= 2) {
-    // Беремо тільки перший символ якщо раптом прийде кілька через кому
-    symbol = topicParts[1].split(',')[0].trim();
-  }
-  // Фолбек: якщо символ є прямо в data
-  if (!symbol && data.symbol) symbol = data.symbol;
-  if (!symbol) return;
-
-  // Витягуємо ціни — KuCoin може використовувати різні назви полів
-  const markPrice  = parseFloat(data.markPrice  ?? data.price       ?? data.mark       ?? NaN);
-  const indexPrice = parseFloat(data.indexPrice ?? data.indexPrice  ?? data.index      ?? NaN);
-
-  if (isNaN(markPrice) && isNaN(indexPrice)) {
-    // Якщо поля зовсім інші — логуємо щоб побачити
-    if (CONFIG.DEBUG_RAW_MESSAGES) {
-      console.log(`[DEBUG] Unknown data fields for ${symbol}:`, Object.keys(data));
+  // ── Варіант A: /contractMarket/snapshot ────────────────────────────────────
+  // subject === 'snapshot.depth.update' або 'ticker'
+  // data містить: markPrice, indexPrice, lastTradePrice, bestBidPrice, ...
+  if (topic.startsWith('/contractMarket/snapshot')) {
+    const symbol     = topic.split(':')[1];
+    const markPrice  = parseFloat(data.markPrice  ?? NaN);
+    const indexPrice = parseFloat(data.indexPrice ?? NaN);
+    if (symbol && !isNaN(markPrice)) {
+      processInstrument(symbol, markPrice, indexPrice);
     }
     return;
   }
 
-  processInstrument(symbol, markPrice, indexPrice);
+  // ── Варіант B: /contract/instrument — тільки mark.index.price ─────────────
+  // Ігноруємо funding rate (subject === 'funding.rate.preview')
+  if (topic.startsWith('/contract/instrument') && subject === 'mark.index.price') {
+    const symbol     = topic.split(':')[1]?.split(',')[0]?.trim();
+    const markPrice  = parseFloat(data.markPrice  ?? NaN);
+    const indexPrice = parseFloat(data.indexPrice ?? NaN);
+    if (symbol && !isNaN(markPrice)) {
+      processInstrument(symbol, markPrice, indexPrice);
+    }
+    return;
+  }
 }
 
 // ─── WEBSOCKET ─────────────────────────────────────────────────────────────────
@@ -193,61 +167,55 @@ async function getPublicToken() {
   const res = await axios.post(`${CONFIG.KC_FUTURES_REST}/api/v1/bullet-public`);
   if (res.data.code !== '200000') throw new Error(`Token error: ${res.data.msg}`);
   const { token, instanceServers } = res.data.data;
-  const server = instanceServers[0];
-  return {
-    token,
-    endpoint:       server.endpoint,
-    pingIntervalMs: server.pingInterval,
-  };
+  const srv = instanceServers[0];
+  return { token, endpoint: srv.endpoint, pingIntervalMs: srv.pingInterval };
 }
 
 function createConnection(symbols, tokenInfo, connIndex) {
   return new Promise((resolve, reject) => {
-    const connectId = randomUUID().replace(/-/g, '');
-    const url = `${tokenInfo.endpoint}?token=${tokenInfo.token}&connectId=${connectId}`;
-
+    const url = `${tokenInfo.endpoint}?token=${tokenInfo.token}&connectId=${randomUUID().replace(/-/g,'')}`;
     console.log(`[WS #${connIndex + 1}] Connecting (${symbols.length} symbols)...`);
+
     const ws = new WebSocket(url);
     let resolved = false;
     let pingTimer = null;
 
-    function startHeartbeat() {
-      pingTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ id: Date.now().toString(), type: 'ping' }));
-        }
-      }, tokenInfo.pingIntervalMs - 2000);
-    }
-
-    ws.on('open', () => console.log(`[WS #${connIndex + 1}] Socket opened`));
+    ws.on('open', () => console.log(`[WS #${connIndex + 1}] Connected`));
 
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
 
         if (msg.type === 'welcome') {
-          startHeartbeat();
+          // Heartbeat
+          pingTimer = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ id: Date.now().toString(), type: 'ping' }));
+            }
+          }, tokenInfo.pingIntervalMs - 2000);
 
-          // Підписуємось — одна підписка на всі символи через кому
-          const topic = `/contract/instrument:${symbols.join(',')}`;
-          ws.send(JSON.stringify({ id: Date.now().toString(), type: 'subscribe', topic, response: true }));
-          console.log(`[WS #${connIndex + 1}] Subscribed topic sent`);
+          // Підписуємось на SNAPSHOT — найбагатший і найчастіший стрім
+          // Він включає markPrice + indexPrice + lastTradePrice в одному пакеті
+          const snapshotTopic = `/contractMarket/snapshot:${symbols.join(',')}`;
+          ws.send(JSON.stringify({
+            id:       Date.now().toString(),
+            type:     'subscribe',
+            topic:    snapshotTopic,
+            response: true,
+          }));
 
+          console.log(`[WS #${connIndex + 1}] Subscribed /contractMarket/snapshot (${symbols.length} symbols)`);
           if (!resolved) { resolved = true; resolve(ws); }
           return;
         }
 
         if (msg.type === 'pong') return;
-
-        // Підтвердження підписки
         if (msg.type === 'ack') {
-          console.log(`[WS #${connIndex + 1}] Subscription ACK received`);
+          console.log(`[WS #${connIndex + 1}] ACK:`, msg.id);
           return;
         }
 
-        if (msg.type === 'message') {
-          handleDataMessage(msg);
-        }
+        handleMessage(msg);
       } catch (err) {
         console.error(`[WS #${connIndex + 1}] Parse error:`, err.message);
       }
@@ -260,9 +228,8 @@ function createConnection(symbols, tokenInfo, connIndex) {
       console.log(`[WS #${connIndex + 1}] Closed. Reconnecting in ${CONFIG.RECONNECT_DELAY_MS}ms...`);
       setTimeout(async () => {
         try {
-          const newToken = await getPublicToken();
-          const newWs = await createConnection(symbols, newToken, connIndex);
-          state.connections[connIndex] = newWs;
+          const tok = await getPublicToken();
+          state.connections[connIndex] = await createConnection(symbols, tok, connIndex);
         } catch (err) {
           console.error(`[RECONNECT #${connIndex + 1}] Failed:`, err.message);
         }
@@ -279,13 +246,11 @@ function createConnection(symbols, tokenInfo, connIndex) {
 async function fetchSymbols() {
   console.log('[API] Fetching active USDT futures symbols...');
   const res = await axios.get(`${CONFIG.KC_FUTURES_REST}/api/v1/contracts/active`);
-  if (res.data.code !== '200000') throw new Error(`API Error: ${res.data.msg}`);
-
+  if (res.data.code !== '200000') throw new Error(res.data.msg);
   const symbols = res.data.data
     .filter(c => c.status === 'Open' && c.settleCurrency === 'USDT')
     .map(c => c.symbol);
-
-  console.log(`[API] Found ${symbols.length} active USDT futures symbols`);
+  console.log(`[API] Found ${symbols.length} active USDT symbols`);
   return symbols;
 }
 
@@ -296,8 +261,8 @@ async function initConnections() {
   }
   console.log(`[WS] Creating ${chunks.length} connection(s)...`);
   for (let i = 0; i < chunks.length; i++) {
-    const tokenInfo = await getPublicToken();
-    const ws = await createConnection(chunks[i], tokenInfo, i);
+    const tok = await getPublicToken();
+    const ws  = await createConnection(chunks[i], tok, i);
     state.connections.push(ws);
     if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 500));
   }
@@ -311,18 +276,14 @@ async function main() {
   console.log('='.repeat(60));
   console.log(`[CONFIG] Entry Threshold : ${CONFIG.SPREAD_ENTRY_THRESHOLD}%`);
   console.log(`[CONFIG] Exit  Threshold : ${CONFIG.SPREAD_EXIT_THRESHOLD}%`);
-  console.log(`[CONFIG] Signal Cooldown : ${CONFIG.SIGNAL_COOLDOWN_MS / 1000}s`);
-  console.log(`[CONFIG] Debug mode      : ${CONFIG.DEBUG_RAW_MESSAGES}`);
+  console.log(`[CONFIG] Cooldown        : ${CONFIG.SIGNAL_COOLDOWN_MS / 1000}s`);
+  console.log(`[CONFIG] Debug           : ${CONFIG.DEBUG_RAW}`);
   console.log('='.repeat(60));
 
   state.symbols = await fetchSymbols();
   await initConnections();
 
   console.log('[BOT] ✅ Monitoring spreads...');
-  if (CONFIG.DEBUG_RAW_MESSAGES) {
-    console.log(`[DEBUG] Will log first ${CONFIG.DEBUG_LIMIT} raw messages to inspect KuCoin data structure`);
-  }
-
   sendTelegram(
     `🤖 <b>KUCOIN SPREAD MONITOR STARTED</b>\n\n` +
     `Моніторинг: ${state.symbols.length} USDT ф'ючерсів\n` +
@@ -331,19 +292,12 @@ async function main() {
   );
 }
 
-// ─── GRACEFUL SHUTDOWN ─────────────────────────────────────────────────────────
+// ─── SHUTDOWN ──────────────────────────────────────────────────────────────────
 process.on('SIGINT', () => {
-  console.log('\n[SHUTDOWN] Shutting down...');
-  state.connections.forEach((ws, i) => {
-    if (ws?.readyState === WebSocket.OPEN) { ws.close(); }
-  });
+  state.connections.forEach(ws => { if (ws?.readyState === WebSocket.OPEN) ws.close(); });
   tg.sendMessage(CONFIG.TELEGRAM_CHAT_ID, '🛑 <b>KUCOIN SPREAD MONITOR STOPPED</b>', { parse_mode: 'HTML' })
     .finally(() => process.exit(0));
 });
-
 process.on('SIGTERM', () => process.exit(0));
 
-main().catch(err => {
-  console.error('[FATAL]', err.message);
-  process.exit(1);
-});
+main().catch(err => { console.error('[FATAL]', err.message); process.exit(1); });
