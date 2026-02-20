@@ -15,11 +15,9 @@ const CONFIG = {
   SPREAD_EXIT_THRESHOLD:  parseFloat(process.env.SPREAD_EXIT_THRESHOLD  || '0.2'),
   SIGNAL_COOLDOWN_MS:     parseInt(process.env.SIGNAL_COOLDOWN_MS       || '60000'),
 
-  KC_FUTURES_REST:   'https://api-futures.kucoin.com',
-  SYMBOLS_PER_SUB:   parseInt(process.env.SYMBOLS_PER_SUB || '50'),
+  KC_FUTURES_REST:    'https://api-futures.kucoin.com',
+  SYMBOLS_PER_SUB:    parseInt(process.env.SYMBOLS_PER_SUB || '50'),
   RECONNECT_DELAY_MS: 5_000,
-
-  DEBUG_RAW: process.env.DEBUG_RAW === 'true',
 };
 
 if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
@@ -31,12 +29,12 @@ if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
 const tg = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN);
 
 const state = {
-  symbols:         [],
-  activeSignals:   new Map(),  // symbol → { direction, entryTime, entrySpread }
-  lastSignalTime:  new Map(),  // symbol → timestamp
-  lastIndexPrice:  new Map(),  // symbol → indexPrice (кеш)
-  connections:     [],
-  stats: { msgs: 0, lastLog: Date.now() },
+  symbols:        [],
+  activeSignals:  new Map(),
+  lastSignalTime: new Map(),
+  lastIndexPrice: new Map(),
+  connections:    [],
+  stats: { msgs: 0, unknown: 0, lastLog: Date.now() },
 };
 
 // ─── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -74,7 +72,6 @@ function formatExit(symbol, markPrice, indexPrice, spread, sig) {
 
 // ─── ЛОГІКА СПРЕДУ ─────────────────────────────────────────────────────────────
 function processInstrument(symbol, markPrice, indexPrice) {
-  // Кеш indexPrice — якщо відсутній у пакеті беремо останнє відоме
   if (!isNaN(indexPrice) && indexPrice > 0) {
     state.lastIndexPrice.set(symbol, indexPrice);
   } else {
@@ -85,37 +82,30 @@ function processInstrument(symbol, markPrice, indexPrice) {
 
   state.stats.msgs++;
 
-  // Лог кожні 2 хвилини: скільки повідомлень обробили
   if (Date.now() - state.stats.lastLog > 2 * 60 * 1000) {
-    console.log(`[STATS] Processed: ${state.stats.msgs} msgs | Active signals: ${state.activeSignals.size}`);
+    console.log(`[STATS] msgs/2min=${state.stats.msgs} | unknown=${state.stats.unknown} | activeSignals=${state.activeSignals.size}`);
     for (const [sym, sig] of state.activeSignals) {
       const age = Math.round((Date.now() - sig.entryTime) / 1000);
-      console.log(`  → ${sym} ${sig.direction} | entry spread=${sig.entrySpread.toFixed(3)}% | ${age}s ago`);
+      console.log(`  → ${sym} entry=${sig.entrySpread.toFixed(3)}% | ${age}s ago`);
     }
-    state.stats.msgs   = 0;
+    state.stats.msgs    = 0;
+    state.stats.unknown = 0;
     state.stats.lastLog = Date.now();
   }
 
   const spread    = ((markPrice - indexPrice) / indexPrice) * 100;
   const absSpread = Math.abs(spread);
   const hasSignal = state.activeSignals.has(symbol);
-  const lastSent  = state.lastSignalTime.get(symbol) || 0;
-  const cooldown  = (Date.now() - lastSent) >= CONFIG.SIGNAL_COOLDOWN_MS;
+  const cooldown  = (Date.now() - (state.lastSignalTime.get(symbol) || 0)) >= CONFIG.SIGNAL_COOLDOWN_MS;
 
-  // ── ENTRY ──────────────────────────────────────────────────────────────────
   if (!hasSignal && absSpread >= CONFIG.SPREAD_ENTRY_THRESHOLD && cooldown) {
     console.log(`[ENTRY] ${symbol} spread=${spread.toFixed(3)}% mark=${markPrice} idx=${indexPrice}`);
-    state.activeSignals.set(symbol, {
-      direction:   spread > 0 ? 'SHORT' : 'LONG',
-      entryTime:   Date.now(),
-      entrySpread: spread,
-    });
+    state.activeSignals.set(symbol, { direction: spread > 0 ? 'SHORT' : 'LONG', entryTime: Date.now(), entrySpread: spread });
     state.lastSignalTime.set(symbol, Date.now());
     sendTelegram(formatEntry(symbol, spread, markPrice, indexPrice));
     return;
   }
 
-  // ── EXIT ───────────────────────────────────────────────────────────────────
   if (hasSignal && absSpread <= CONFIG.SPREAD_EXIT_THRESHOLD) {
     const sig = state.activeSignals.get(symbol);
     console.log(`[EXIT]  ${symbol} spread=${spread.toFixed(3)}%`);
@@ -124,7 +114,10 @@ function processInstrument(symbol, markPrice, indexPrice) {
   }
 }
 
-// ─── ПАРСИНГ ПОВІДОМЛЕНЬ ───────────────────────────────────────────────────────
+// ─── ПАРСИНГ ───────────────────────────────────────────────────────────────────
+// Логуємо перші 3 повідомлення кожного нового subject щоб знати структуру
+const seenSubjects = new Set();
+
 function handleMessage(msg) {
   if (msg.type !== 'message') return;
 
@@ -132,34 +125,39 @@ function handleMessage(msg) {
   const subject = msg.subject ?? '';
   const data    = msg.data    ?? {};
 
-  if (CONFIG.DEBUG_RAW) {
-    console.log('[RAW]', JSON.stringify({ topic, subject, dataKeys: Object.keys(data) }));
+  // Логуємо кожен новий subject що бачимо вперше
+  if (!seenSubjects.has(subject)) {
+    seenSubjects.add(subject);
+    console.log(`[NEW SUBJECT] "${subject}" | topic="${topic}" | dataKeys=${JSON.stringify(Object.keys(data))}`);
   }
 
-  // ── Варіант A: /contractMarket/snapshot ────────────────────────────────────
-  // subject === 'snapshot.depth.update' або 'ticker'
-  // data містить: markPrice, indexPrice, lastTradePrice, bestBidPrice, ...
-  if (topic.startsWith('/contractMarket/snapshot')) {
-    const symbol     = topic.split(':')[1];
+  // Ігноруємо funding rate — нам не потрібно
+  if (subject === 'funding.rate.preview' || subject === 'funding.rate') return;
+
+  // mark.index.price — основний стрім
+  if (subject === 'mark.index.price') {
+    // symbol береться з topic: '/contract/instrument:BTCUSDTM'
+    const symbol = topic.split(':')[1]?.split(',')[0]?.trim();
+    if (!symbol) return;
+
     const markPrice  = parseFloat(data.markPrice  ?? NaN);
     const indexPrice = parseFloat(data.indexPrice ?? NaN);
-    if (symbol && !isNaN(markPrice)) {
-      processInstrument(symbol, markPrice, indexPrice);
-    }
+    processInstrument(symbol, markPrice, indexPrice);
     return;
   }
 
-  // ── Варіант B: /contract/instrument — тільки mark.index.price ─────────────
-  // Ігноруємо funding rate (subject === 'funding.rate.preview')
-  if (topic.startsWith('/contract/instrument') && subject === 'mark.index.price') {
-    const symbol     = topic.split(':')[1]?.split(',')[0]?.trim();
-    const markPrice  = parseFloat(data.markPrice  ?? NaN);
+  // Якщо прийшов якийсь інший subject з markPrice — теж обробляємо
+  if (data.markPrice !== undefined) {
+    const symbol = topic.split(':')[1]?.split(',')[0]?.trim() ?? data.symbol;
+    if (!symbol) return;
+    const markPrice  = parseFloat(data.markPrice);
     const indexPrice = parseFloat(data.indexPrice ?? NaN);
-    if (symbol && !isNaN(markPrice)) {
-      processInstrument(symbol, markPrice, indexPrice);
-    }
+    processInstrument(symbol, markPrice, indexPrice);
     return;
   }
+
+  // Якщо дані є але ми не знаємо як їх розпарсити — рахуємо
+  state.stats.unknown++;
 }
 
 // ─── WEBSOCKET ─────────────────────────────────────────────────────────────────
@@ -187,31 +185,26 @@ function createConnection(symbols, tokenInfo, connIndex) {
         const msg = JSON.parse(raw.toString());
 
         if (msg.type === 'welcome') {
-          // Heartbeat
           pingTimer = setInterval(() => {
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ id: Date.now().toString(), type: 'ping' }));
             }
           }, tokenInfo.pingIntervalMs - 2000);
 
-          // Підписуємось на SNAPSHOT — найбагатший і найчастіший стрім
-          // Він включає markPrice + indexPrice + lastTradePrice в одному пакеті
-          const snapshotTopic = `/contractMarket/snapshot:${symbols.join(',')}`;
-          ws.send(JSON.stringify({
-            id:       Date.now().toString(),
-            type:     'subscribe',
-            topic:    snapshotTopic,
-            response: true,
-          }));
+          // Підписуємось на /contract/instrument — він підтримує кілька символів через кому
+          // і надсилає і mark.index.price і funding.rate.preview
+          // Ми будемо фільтрувати тільки mark.index.price
+          const topic = `/contract/instrument:${symbols.join(',')}`;
+          ws.send(JSON.stringify({ id: Date.now().toString(), type: 'subscribe', topic, response: true }));
+          console.log(`[WS #${connIndex + 1}] Subscribed /contract/instrument (${symbols.length} symbols)`);
 
-          console.log(`[WS #${connIndex + 1}] Subscribed /contractMarket/snapshot (${symbols.length} symbols)`);
           if (!resolved) { resolved = true; resolve(ws); }
           return;
         }
 
         if (msg.type === 'pong') return;
         if (msg.type === 'ack') {
-          console.log(`[WS #${connIndex + 1}] ACK:`, msg.id);
+          console.log(`[WS #${connIndex + 1}] ACK: ${msg.id}`);
           return;
         }
 
@@ -274,10 +267,9 @@ async function main() {
   console.log('='.repeat(60));
   console.log('📊 KUCOIN FUTURES SPREAD MONITOR');
   console.log('='.repeat(60));
-  console.log(`[CONFIG] Entry Threshold : ${CONFIG.SPREAD_ENTRY_THRESHOLD}%`);
-  console.log(`[CONFIG] Exit  Threshold : ${CONFIG.SPREAD_EXIT_THRESHOLD}%`);
-  console.log(`[CONFIG] Cooldown        : ${CONFIG.SIGNAL_COOLDOWN_MS / 1000}s`);
-  console.log(`[CONFIG] Debug           : ${CONFIG.DEBUG_RAW}`);
+  console.log(`[CONFIG] Entry : ${CONFIG.SPREAD_ENTRY_THRESHOLD}%`);
+  console.log(`[CONFIG] Exit  : ${CONFIG.SPREAD_EXIT_THRESHOLD}%`);
+  console.log(`[CONFIG] Cooldown: ${CONFIG.SIGNAL_COOLDOWN_MS / 1000}s`);
   console.log('='.repeat(60));
 
   state.symbols = await fetchSymbols();
@@ -292,7 +284,6 @@ async function main() {
   );
 }
 
-// ─── SHUTDOWN ──────────────────────────────────────────────────────────────────
 process.on('SIGINT', () => {
   state.connections.forEach(ws => { if (ws?.readyState === WebSocket.OPEN) ws.close(); });
   tg.sendMessage(CONFIG.TELEGRAM_CHAT_ID, '🛑 <b>KUCOIN SPREAD MONITOR STOPPED</b>', { parse_mode: 'HTML' })
