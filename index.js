@@ -16,7 +16,11 @@ const CONFIG = {
   SIGNAL_COOLDOWN_MS:     parseInt(process.env.SIGNAL_COOLDOWN_MS       || '60000'),
 
   KC_FUTURES_REST:    'https://api-futures.kucoin.com',
-  SYMBOLS_PER_SUB:    parseInt(process.env.SYMBOLS_PER_SUB || '50'),
+
+  // KuCoin ліміт: 300 топіків/з'єднання
+  // На кожен символ 2 топіки (instrument + tickerV2) → 100 символів/з'єднання
+  SYMBOLS_PER_CONN:   parseInt(process.env.SYMBOLS_PER_CONN || '100'),
+
   RECONNECT_DELAY_MS: 5_000,
 };
 
@@ -32,19 +36,11 @@ const state = {
   symbols:        [],
   activeSignals:  new Map(),
   lastSignalTime: new Map(),
-
-  markPrice:  new Map(), // symbol → markPrice  (з /contract/instrument)
-  bidPrice:   new Map(), // symbol → bestBidPrice (з tickerV2)
-  askPrice:   new Map(), // symbol → bestAskPrice (з tickerV2)
-
-  connections: [],
-
-  // Детальна статистика по топіках
-  stats: {
-    instrument: 0,  // кількість mark.index.price повідомлень
-    ticker:     0,  // кількість tickerV2 повідомлень
-    lastLog:    Date.now(),
-  },
+  markPrice:      new Map(), // symbol → markPrice
+  bidPrice:       new Map(), // symbol → bestBidPrice
+  askPrice:       new Map(), // symbol → bestAskPrice
+  connections:    [],
+  stats: { instrument: 0, ticker: 0, lastLog: Date.now() },
 };
 
 // ─── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -81,10 +77,6 @@ function formatExit(symbol, marketPrice, markPrice, spread, sig) {
 }
 
 // ─── ЛОГІКА СПРЕДУ ─────────────────────────────────────────────────────────────
-// Порівнюємо BID або ASK з markPrice:
-// - якщо bestBid << markPrice → ринок падає нижче справедливої ціни → LONG сигнал
-// - якщо bestAsk >> markPrice → ринок вище справедливої ціни → SHORT сигнал
-// Беремо максимальне відхилення з двох варіантів.
 function checkSpread(symbol) {
   const markPrice = state.markPrice.get(symbol);
   const bid       = state.bidPrice.get(symbol);
@@ -93,34 +85,23 @@ function checkSpread(symbol) {
   if (!markPrice || markPrice === 0) return;
   if (!bid && !ask) return;
 
-  // Рахуємо спред по bid і по ask, беремо більший за абсолютним значенням
   const bidSpread = bid ? ((bid - markPrice) / markPrice) * 100 : 0;
   const askSpread = ask ? ((ask - markPrice) / markPrice) * 100 : 0;
-
-  // Беремо той що далі від нуля
-  const spread = Math.abs(bidSpread) >= Math.abs(askSpread) ? bidSpread : askSpread;
+  const spread    = Math.abs(bidSpread) >= Math.abs(askSpread) ? bidSpread : askSpread;
   const absSpread = Math.abs(spread);
-
-  // Для відображення беремо відповідну ціну
   const displayPrice = Math.abs(bidSpread) >= Math.abs(askSpread) ? bid : ask;
 
   const hasSignal = state.activeSignals.has(symbol);
   const cooldown  = (Date.now() - (state.lastSignalTime.get(symbol) || 0)) >= CONFIG.SIGNAL_COOLDOWN_MS;
 
-  // ── ENTRY ──────────────────────────────────────────────────────────────────
   if (!hasSignal && absSpread >= CONFIG.SPREAD_ENTRY_THRESHOLD && cooldown) {
     console.log(`[ENTRY] ${symbol} spread=${spread.toFixed(3)}% market=${displayPrice} mark=${markPrice}`);
-    state.activeSignals.set(symbol, {
-      direction:   spread > 0 ? 'SHORT' : 'LONG',
-      entryTime:   Date.now(),
-      entrySpread: spread,
-    });
+    state.activeSignals.set(symbol, { direction: spread > 0 ? 'SHORT' : 'LONG', entryTime: Date.now(), entrySpread: spread });
     state.lastSignalTime.set(symbol, Date.now());
     sendTelegram(formatEntry(symbol, spread, displayPrice, markPrice));
     return;
   }
 
-  // ── EXIT ───────────────────────────────────────────────────────────────────
   if (hasSignal && absSpread <= CONFIG.SPREAD_EXIT_THRESHOLD) {
     const sig = state.activeSignals.get(symbol);
     console.log(`[EXIT]  ${symbol} spread=${spread.toFixed(3)}%`);
@@ -132,33 +113,19 @@ function checkSpread(symbol) {
 // ─── СТАТИСТИКА ────────────────────────────────────────────────────────────────
 function logStats() {
   if (Date.now() - state.stats.lastLog < 2 * 60 * 1000) return;
-
-  console.log(
-    `[STATS] instrument msgs: ${state.stats.instrument} | ` +
-    `ticker msgs: ${state.stats.ticker} | ` +
-    `activeSignals: ${state.activeSignals.size}`
-  );
-
-  // Якщо ticker = 0 — tickerV2 не працює, треба щось міняти
-  if (state.stats.ticker === 0) {
-    console.warn('[WARN] tickerV2 отримав 0 повідомлень! Перевір підписку.');
-  }
-  if (state.stats.instrument === 0) {
-    console.warn('[WARN] instrument отримав 0 повідомлень! Перевір підписку.');
-  }
-
+  console.log(`[STATS] instrument/2min=${state.stats.instrument} | ticker/2min=${state.stats.ticker} | activeSignals=${state.activeSignals.size}`);
+  if (state.stats.ticker === 0) console.warn('[WARN] tickerV2: 0 msgs — підписка не працює!');
+  if (state.stats.instrument === 0) console.warn('[WARN] instrument: 0 msgs — підписка не працює!');
   for (const [sym, sig] of state.activeSignals) {
     const age = Math.round((Date.now() - sig.entryTime) / 1000);
     console.log(`  → ${sym} ${sig.direction} | entry=${sig.entrySpread.toFixed(3)}% | ${age}s ago`);
   }
-
   state.stats.instrument = 0;
   state.stats.ticker     = 0;
   state.stats.lastLog    = Date.now();
 }
 
 // ─── ПАРСИНГ ───────────────────────────────────────────────────────────────────
-// Логуємо перший раз кожен новий subject — щоб бачити реальну структуру
 const seenSubjects = new Set();
 
 function handleMessage(msg) {
@@ -168,47 +135,37 @@ function handleMessage(msg) {
   const subject = msg.subject ?? '';
   const data    = msg.data    ?? {};
 
-  // Перший раз бачимо цей subject — логуємо структуру
+  // Перший раз бачимо subject — логуємо повністю
   if (!seenSubjects.has(subject)) {
     seenSubjects.add(subject);
-    console.log(`[NEW SUBJECT] "${subject}" topic="${topic}" keys=${JSON.stringify(Object.keys(data))}`);
-    // Показуємо і самі значення щоб знати назви полів
-    console.log(`[NEW SUBJECT DATA]`, JSON.stringify(data));
+    console.log(`[NEW SUBJECT] "${subject}" | keys=${JSON.stringify(Object.keys(data))} | sample=${JSON.stringify(data)}`);
   }
 
   logStats();
 
-  // ── /contract/instrument → mark.index.price ────────────────────────────────
+  // ── mark price з /contract/instrument ──────────────────────────────────────
   if (subject === 'mark.index.price') {
     state.stats.instrument++;
-    const symbol = topic.split(':')[1]?.split(',')[0]?.trim();
+    const symbol = topic.split(':')[1]?.trim();
     if (!symbol) return;
-
     const mp = parseFloat(data.markPrice);
     if (!isNaN(mp) && mp > 0) {
       state.markPrice.set(symbol, mp);
-      // Перевіряємо спред якщо вже є bid або ask
-      if (state.bidPrice.has(symbol) || state.askPrice.has(symbol)) {
-        checkSpread(symbol);
-      }
+      if (state.bidPrice.has(symbol) || state.askPrice.has(symbol)) checkSpread(symbol);
     }
     return;
   }
 
-  // ── /contractMarket/tickerV2 → bid/ask ─────────────────────────────────────
-  if (topic.startsWith('/contractMarket/tickerV2')) {
+  // ── bid/ask з /contractMarket/tickerV2 ─────────────────────────────────────
+  // tickerV2 приходить з topic='/contractMarket/tickerV2:BTCUSDTM' без subject
+  if (topic.startsWith('/contractMarket/tickerV2:')) {
     state.stats.ticker++;
     const symbol = topic.split(':')[1]?.trim();
     if (!symbol) return;
-
-    // tickerV2 поля: bestBidPrice, bestBidSize, bestAskPrice, bestAskSize
     const bid = parseFloat(data.bestBidPrice ?? NaN);
     const ask = parseFloat(data.bestAskPrice ?? NaN);
-
     if (!isNaN(bid) && bid > 0) state.bidPrice.set(symbol, bid);
     if (!isNaN(ask) && ask > 0) state.askPrice.set(symbol, ask);
-
-    // Перевіряємо спред якщо вже є markPrice
     if (state.markPrice.has(symbol)) checkSpread(symbol);
     return;
   }
@@ -226,12 +183,11 @@ async function getPublicToken() {
 function createConnection(symbols, tokenInfo, connIndex) {
   return new Promise((resolve, reject) => {
     const url = `${tokenInfo.endpoint}?token=${tokenInfo.token}&connectId=${randomUUID().replace(/-/g,'')}`;
-    console.log(`[WS #${connIndex + 1}] Connecting (${symbols.length} symbols)...`);
+    console.log(`[WS #${connIndex + 1}] Connecting (${symbols.length} symbols, ${symbols.length * 2} topics)...`);
 
     const ws = new WebSocket(url);
     let resolved = false;
     let pingTimer = null;
-    let ackCount  = 0; // очікуємо 2 ACK (instrument + tickerV2)
 
     ws.on('open', () => console.log(`[WS #${connIndex + 1}] Connected`));
 
@@ -246,34 +202,37 @@ function createConnection(symbols, tokenInfo, connIndex) {
             }
           }, tokenInfo.pingIntervalMs - 2000);
 
-          const symList = symbols.join(',');
+          // Підписка на /contract/instrument — підтримує comma list
+          const instTopic = `/contract/instrument:${symbols.join(',')}`;
+          ws.send(JSON.stringify({ id: `inst_${connIndex}`, type: 'subscribe', topic: instTopic, response: true }));
 
-          // Підписка 1: markPrice (оновлюється ~1 раз/сек)
-          ws.send(JSON.stringify({
-            id:       `inst_${connIndex}_${Date.now()}`,
-            type:     'subscribe',
-            topic:    `/contract/instrument:${symList}`,
-            response: true,
-          }));
+          // Підписка на tickerV2 — ОКРЕМО на кожен символ (не підтримує comma list!)
+          // Надсилаємо пачками по 10 щоб не перевантажити
+          let delay = 100;
+          for (let i = 0; i < symbols.length; i++) {
+            setTimeout(() => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  id:       `tick_${connIndex}_${i}`,
+                  type:     'subscribe',
+                  topic:    `/contractMarket/tickerV2:${symbols[i]}`,
+                  response: false, // false щоб не флудити ACK-ами
+                }));
+              }
+            }, delay + Math.floor(i / 10) * 100); // 10 підписок кожні 100мс
+          }
 
-          // Підписка 2: best bid/ask (оновлюється при кожній зміні ордербуку)
-          ws.send(JSON.stringify({
-            id:       `tick_${connIndex}_${Date.now()}`,
-            type:     'subscribe',
-            topic:    `/contractMarket/tickerV2:${symList}`,
-            response: true,
-          }));
-
-          console.log(`[WS #${connIndex + 1}] Subscriptions sent for ${symbols.length} symbols`);
+          console.log(`[WS #${connIndex + 1}] Subscribing ${symbols.length} instrument + ${symbols.length} tickerV2...`);
           if (!resolved) { resolved = true; resolve(ws); }
           return;
         }
 
         if (msg.type === 'pong') return;
-
         if (msg.type === 'ack') {
-          ackCount++;
-          console.log(`[WS #${connIndex + 1}] ACK ${ackCount}/2: ${msg.id}`);
+          // Логуємо тільки instrument ACK
+          if (msg.id?.startsWith('inst_')) {
+            console.log(`[WS #${connIndex + 1}] instrument ACK ✓`);
+          }
           return;
         }
 
@@ -318,15 +277,15 @@ async function fetchSymbols() {
 
 async function initConnections() {
   const chunks = [];
-  for (let i = 0; i < state.symbols.length; i += CONFIG.SYMBOLS_PER_SUB) {
-    chunks.push(state.symbols.slice(i, i + CONFIG.SYMBOLS_PER_SUB));
+  for (let i = 0; i < state.symbols.length; i += CONFIG.SYMBOLS_PER_CONN) {
+    chunks.push(state.symbols.slice(i, i + CONFIG.SYMBOLS_PER_CONN));
   }
-  console.log(`[WS] Creating ${chunks.length} connection(s)...`);
+  console.log(`[WS] Creating ${chunks.length} connection(s) (${CONFIG.SYMBOLS_PER_CONN} symbols each)...`);
   for (let i = 0; i < chunks.length; i++) {
     const tok = await getPublicToken();
     const ws  = await createConnection(chunks[i], tok, i);
     state.connections.push(ws);
-    if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 500));
+    if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 1_000));
   }
   console.log(`[WS] All ${chunks.length} connection(s) established`);
 }
@@ -344,9 +303,7 @@ async function main() {
   state.symbols = await fetchSymbols();
   await initConnections();
 
-  console.log('[BOT] ✅ Monitoring spreads...');
-  console.log('[BOT] Waiting for [NEW SUBJECT] logs to confirm data flow...');
-
+  console.log('[BOT] ✅ Monitoring spreads. Waiting for [NEW SUBJECT] to confirm data...');
   sendTelegram(
     `🤖 <b>KUCOIN SPREAD MONITOR STARTED</b>\n\n` +
     `Моніторинг: ${state.symbols.length} USDT ф'ючерсів\n` +
